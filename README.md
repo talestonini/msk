@@ -1,11 +1,18 @@
 # MSK Sandpit
 
-## Bastion
+## Bastion and Setup
 
     BASTION=$(aws cloudformation describe-stacks --stack-name basic-msk \
       --query "Stacks[0].Outputs[?OutputKey=='BastionInstanceId'].OutputValue" --output text)
     aws ssm start-session --target "$BASTION"
     bash -l
+    msk-setup
+    kafka-acls.sh --bootstrap-server $(cat ~/msk/bootstrap.txt) \
+      --command-config ~/msk/admin.properties \
+      --add --allow-principal User:admin --operation All \
+      --cluster --topic '*' --group '*' --transactional-id '*'
+    aws cloudformation deploy --template-file iac/msk-cluster.yaml --stack-name basic-msk --capabilities \
+      CAPABILITY_IAM --parameter-overrides AllowEveryoneIfNoAclFound=false
 
 
 ## Schemas
@@ -19,7 +26,7 @@
 
     kafka-topics.sh --bootstrap-server $(cat ~/msk/bootstrap.txt) \
       --command-config ~/msk/admin.properties \
-      --create --topic temperature-changed \
+      --create --topic com.example.events.TemperatureChanged \
       --partitions 3 --replication-factor 2
 
     kafka-topics.sh --bootstrap-server $(cat ~/msk/bootstrap.txt) \

@@ -252,6 +252,10 @@ Resources:
       Description: Basic broker configuration
       KafkaVersionsList:
         - !Ref KafkaVersion
+      # The internal __consumer_offsets and __transaction_state topics (needed by
+      # consumer groups and transactional / exactly-once producers) default to 3
+      # replicas, which a 2-broker cluster can't host. These only take effect when
+      # the internal topics are first created.
       ServerProperties: !Sub |
         auto.create.topics.enable=false
         default.replication.factor=2
@@ -259,6 +263,9 @@ Resources:
         num.partitions=1
         log.retention.hours=168
         allow.everyone.if.no.acl.found=${AllowEveryoneIfNoAclFound}
+        offsets.topic.replication.factor=2
+        transaction.state.log.replication.factor=2
+        transaction.state.log.min.isr=1
 
   MskCluster:
     Type: AWS::MSK::Cluster
