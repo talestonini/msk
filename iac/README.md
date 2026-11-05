@@ -28,6 +28,12 @@
    kafka-acls.sh --bootstrap-server <brokers> --command-config client.properties --add \
      --allow-principal User:admin --operation All --cluster --topic '*' --group '*'
    ```
+
+    kafka-acls.sh --bootstrap-server $(cat ~/msk/bootstrap.txt) \
+      --command-config ~/msk/admin.properties \
+      --add --allow-principal User:admin --operation All \
+      --cluster --topic '*' --group '*' --transactional-id '*'
+
    Add ACLs for any other users at this point too.
 4. Lock it down: redeploy with `--parameter-overrides AllowEveryoneIfNoAclFound=false`. CloudFormation creates a new configuration revision and applies it to the brokers with a rolling restart.
 
@@ -246,3 +252,47 @@ Access to the registry is controlled by IAM, not by Kafka SCRAM or ACLs. Apps si
 I haven't built anything with these libraries yet.
 
 **Cost:** I didn't price the registry with the Pricing API, but as far as I know AWS doesn't charge for Glue Schema Registry, so the weekly estimate stays at about US$31. One thing to plan for: the bastion reaches the Glue API through the internet gateway, but apps in the private subnets later would need a Glue VPC interface endpoint, which has an hourly charge.
+
+
+---
+
+
+There's no stack called `basic-msk` in `ap-southeast-2` yet, so there's no bastion to connect to. Deploy first. The MSK cluster takes 20–30 minutes:
+
+```bash
+aws cloudformation deploy --template-file iac/msk-cluster.yaml --stack-name basic-msk \
+  --capabilities CAPABILITY_IAM
+```
+
+If you used a different stack name, substitute it below.
+
+**1. Connect from your machine**, using Session Manager rather than SSH:
+```bash
+BASTION=$(aws cloudformation describe-stacks --stack-name basic-msk \
+  --query "Stacks[0].Outputs[?OutputKey=='BastionInstanceId'].OutputValue" --output text)
+aws ssm start-session --target "$BASTION"
+```
+
+**2. Switch to a normal shell.** Sessions start in `sh` as `ssm-user`, in `/usr/bin`. Switch to bash in your home directory:
+```bash
+bash -l   # login shell: loads the Kafka PATH and .NET settings
+cd ~
+```
+
+**3. Check that the boot script has finished.** On first boot, installing Java, .NET and the Kafka tools takes a few minutes. If `msk-setup` or `kafka-topics.sh` isn't found yet, wait and check the log:
+```bash
+sudo tail -f /var/log/cloud-init-output.log
+```
+
+**4. Get credentials and start working:**
+```bash
+msk-setup        # writes ~/msk/bootstrap.txt, admin.properties, admin.env
+kafka-topics.sh --bootstrap-server $(cat ~/msk/bootstrap.txt) --command-config ~/msk/admin.properties --list
+```
+
+To leave, type `exit` twice: once for `bash`, once for the session.
+
+**Good to know:**
+- **Your files persist:** `ssm-user`'s home directory is on the bastion's disk, so it survives stopping and starting the instance. It's lost only if the instance is replaced.
+- **"TargetNotConnected":** the bastion hasn't registered with SSM yet. Give it a few minutes after the stack finishes.
+- **Port forwarding:** you can tunnel through the bastion to use a local IDE or tool against a broker. For example, `aws ssm start-session --target "$BASTION" --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters host=<broker-host>,portNumber=9096,localPortNumber=9096`. Note that Kafka clients then try to connect to each broker's own address, which only works inside the VPC, so for Kafka itself it's simpler to run the apps on the bastion.

@@ -1,0 +1,26 @@
+{
+  "type": "record",
+  "name": "TemperatureChanged",
+  "namespace": "com.example.events",
+  "doc": "Emitted when a thermometer reports a new temperature reading.",
+  "fields": [
+    {
+      "name": "thermometerId",
+      "type": "string",
+      "doc": "Unique identifier of the thermometer that took the reading."
+    },
+    {
+      "name": "temperature",
+      "type": "float",
+      "doc": "Temperature reading, in degrees Celsius."
+    },
+    {
+      "name": "timestamp",
+      "type": {
+        "type": "long",
+        "logicalType": "timestamp-millis"
+      },
+      "doc": "When the reading was taken, as a Unix timestamp in milliseconds (UTC)."
+    }
+  ]
+}
