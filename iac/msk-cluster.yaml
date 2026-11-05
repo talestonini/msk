@@ -230,6 +230,8 @@ Resources:
   #   3. Grant it ACLs from the bastion (see kafka-acls.sh --producer/--consumer).
   #   4. Give the application's IAM role secretsmanager:GetSecretValue on its
   #      own secret and kms:Decrypt on ScramSecretKey, so it can read its password.
+  #      If it uses the schema registry, also grant the Glue actions it needs
+  #      (see BastionRole for the full list; consumers only need GetSchemaVersion).
   ExampleAppScramSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -300,6 +302,18 @@ Resources:
         - !Ref AdminScramSecret
         - !Ref ExampleAppScramSecret
 
+  # -------------------------------------------------- Glue Schema Registry
+  # Schemas are typically auto-registered by producers using the AWS Glue
+  # Schema Registry serializers. Access is controlled by IAM (not Kafka ACLs).
+  SchemaRegistry:
+    Type: AWS::Glue::Registry
+    Properties:
+      Name: !Sub '${ClusterName}-registry'
+      Description: !Sub 'Schema registry for MSK cluster ${ClusterName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-registry'
+
   # ------------------------------------------------------------ Bastion host
   # Accessed via SSM Session Manager: no SSH key and no inbound ports needed.
   BastionSecurityGroup:
@@ -338,6 +352,34 @@ Resources:
               - Effect: Allow
                 Action: kafka:GetBootstrapBrokers
                 Resource: !Ref MskCluster
+              # Full schema management within this cluster's registry.
+              - Effect: Allow
+                Action:
+                  - glue:GetRegistry
+                  - glue:ListSchemas
+                  - glue:CreateSchema
+                  - glue:GetSchema
+                  - glue:UpdateSchema
+                  - glue:DeleteSchema
+                  - glue:GetSchemaByDefinition
+                  - glue:RegisterSchemaVersion
+                  - glue:ListSchemaVersions
+                  - glue:GetSchemaVersionsDiff
+                  - glue:DeleteSchemaVersions
+                  - glue:PutSchemaVersionMetadata
+                  - glue:QuerySchemaVersionMetadata
+                  - glue:RemoveSchemaVersionMetadata
+                Resource:
+                  - !GetAtt SchemaRegistry.Arn
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:schema/${ClusterName}-registry/*'
+              # Deserializers look schema versions up by ID only, which IAM
+              # cannot scope to a registry.
+              - Effect: Allow
+                Action:
+                  - glue:GetSchemaVersion
+                  - glue:CheckSchemaVersionValidity
+                  - glue:ListRegistries
+                Resource: '*'
 
   BastionInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -367,7 +409,24 @@ Resources:
         - Key: Name
           Value: !Sub '${ClusterName}-bastion'
       UserData:
+        # The cloud-config part makes cloud-init run the script on EVERY boot, not
+        # just the first. Changing this user data makes CloudFormation stop and
+        # start the instance (keeping its disk), so stack updates are applied
+        # without replacing the bastion. The script must therefore be idempotent.
         Fn::Base64: !Sub |
+          Content-Type: multipart/mixed; boundary="//"
+          MIME-Version: 1.0
+
+          --//
+          Content-Type: text/cloud-config; charset="us-ascii"
+
+          #cloud-config
+          cloud_final_modules:
+          - [scripts-user, always]
+
+          --//
+          Content-Type: text/x-shellscript; charset="us-ascii"
+
           #!/bin/bash
           set -euxo pipefail
 
@@ -377,10 +436,12 @@ Resources:
 
           # Apache Kafka CLI tools (kafka-topics.sh, kafka-acls.sh, ...).
           # archive.apache.org is rate limited and can stall, so abort slow transfers and retry.
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 20 \
-            --speed-limit 10000 --speed-time 30 -o /tmp/kafka.tgz \
-            https://archive.apache.org/dist/kafka/${KafkaClientVersion}/kafka_2.13-${KafkaClientVersion}.tgz
-          tar -xzf /tmp/kafka.tgz -C /opt && rm -f /tmp/kafka.tgz
+          if [ ! -d /opt/kafka_2.13-${KafkaClientVersion} ]; then
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 20 \
+              --speed-limit 10000 --speed-time 30 -o /tmp/kafka.tgz \
+              https://archive.apache.org/dist/kafka/${KafkaClientVersion}/kafka_2.13-${KafkaClientVersion}.tgz
+            tar -xzf /tmp/kafka.tgz -C /opt && rm -f /tmp/kafka.tgz
+          fi
           ln -sfn /opt/kafka_2.13-${KafkaClientVersion} /opt/kafka
           echo 'export PATH=$PATH:/opt/kafka/bin' > /etc/profile.d/kafka.sh
 
@@ -408,12 +469,15 @@ Resources:
           export MSK_BOOTSTRAP_SERVERS=$BOOTSTRAP
           export MSK_SCRAM_USERNAME=$SCRAM_USER
           export MSK_SCRAM_PASSWORD=$SCRAM_PASS
+          export AWS_REGION=${AWS::Region}
+          export GLUE_SCHEMA_REGISTRY_NAME=${ClusterName}-registry
           ENV
           echo "Wrote ~/msk/bootstrap.txt, ~/msk/$SCRAM_USER.properties and ~/msk/$SCRAM_USER.env"
           echo "CLI example: kafka-topics.sh --bootstrap-server \$(cat ~/msk/bootstrap.txt) --command-config ~/msk/$SCRAM_USER.properties --list"
           echo "App example: source ~/msk/$SCRAM_USER.env && <run your app>"
           EOF
           chmod 755 /usr/local/bin/msk-setup
+          --//--
 
 Outputs:
   ClusterArn:
@@ -451,6 +515,14 @@ Outputs:
   BastionConnectCommand:
     Description: Open a shell on the bastion (requires the Session Manager plugin).
     Value: !Sub 'aws ssm start-session --region ${AWS::Region} --target ${BastionHost}'
+
+  SchemaRegistryName:
+    Description: Name of the Glue Schema Registry.
+    Value: !Sub '${ClusterName}-registry'
+
+  SchemaRegistryArn:
+    Description: ARN of the Glue Schema Registry.
+    Value: !GetAtt SchemaRegistry.Arn
 
   GetBootstrapBrokersCommand:
     Description: Run this to get the SASL/SCRAM broker connection string.

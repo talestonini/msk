@@ -15,7 +15,7 @@
 
 1. Deploy:
    ```bash
-   aws cloudformation deploy --template-file iac/msk-cluster.yaml --stack-name basic-msk
+   aws cloudformation deploy --template-file iac/msk-cluster.yaml --stack-name basic-msk --capabilities CAPABILITY_IAM
    ```
 2. Get the password with `aws secretsmanager get-secret-value --secret-id <ScramSecretArn>`, and write a `client.properties` file:
    ```properties
@@ -204,3 +204,45 @@ Yes, the bastion now has what you need to build and run Java and C# Kafka apps. 
 - **Running an app:** use `msk-setup example-app && source ~/msk/example-app.env && <run your app>`.
 
 `validate-template` still accepts the template, and deploying still needs `--capabilities CAPABILITY_IAM`. The test files are in `~/.msk-bastion-test` and `/tmp/msk-bastion-test`, outside the repo, and can be deleted.
+
+
+--
+
+
+## Deploying on top of an existing stack
+
+**Yes, it applies only the diff.** Running `aws cloudformation deploy` again with the same `--stack-name` creates a change set and touches only new or changed resources. For this update:
+- **Created:** the Glue registry.
+- **Changed in place:** the bastion's IAM permissions.
+- **Restarted:** the bastion is stopped and started (because its boot script changed) and keeps its disk.
+- **Unchanged:** MSK, the VPC, KMS and the secrets.
+
+To see exactly what will happen before applying it, preview the change set:
+```bash
+aws cloudformation deploy --template-file iac/msk-cluster.yaml --stack-name basic-msk \
+  --capabilities CAPABILITY_IAM --no-execute-changeset
+# then run the describe-change-set command it prints. Check each resource's
+# "Replacement" field: True means delete and recreate.
+```
+
+**However, I couldn't find an existing stack.** Your current credentials in `ap-southeast-2` have no stack with "msk" or "kafka" in its name, in any status. Since you hit the capabilities error, the first deploy probably never ran. If you deployed with a different profile or region, check there. Otherwise this will be a normal first deploy.
+
+**I fixed a problem with updating the bastion.** EC2 normally runs the boot script only on an instance's first boot. A stack update would restart the bastion but not apply its new script, and replacing the instance would delete anything in your home directory. The boot script now runs on every boot and is safe to rerun: for example, it skips the Kafka download if the tools are already installed. Restarting the bastion, or updating the stack, reapplies it. I checked the script's shell syntax but haven't rerun the container test.
+
+## Glue Schema Registry
+
+Added to [iac/msk-cluster.yaml](iac/msk-cluster.yaml); `validate-template` accepts it:
+- **The registry:** `<ClusterName>-registry`, with its name and ARN as stack outputs. There are no predefined schemas: producers usually register them automatically through the Glue serializers.
+- **Bastion permissions:** full schema management within this registry. Deserializers look schemas up by version ID only, and IAM can't limit that lookup to one registry, so `GetSchemaVersion` is granted on all registries.
+- **`msk-setup` env file:** now also sets `AWS_REGION` and `GLUE_SCHEMA_REGISTRY_NAME`.
+- **App users:** the template comment now notes that app IAM roles need Glue permissions too.
+
+Access to the registry is controlled by IAM, not by Kafka SCRAM or ACLs. Apps sign registry requests with their AWS credentials (on the bastion, its instance role) and keep using SCRAM for Kafka itself.
+
+**Client libraries:**
+- **Java:** `software.amazon.glue:schema-registry-serde` (latest is 1.1.25).
+- **C#:** `AWS.Glue.SchemaRegistry` 1.0.1, from AWS's NuGet account. It's published only as a `linux-x64` build, which matches the bastion.
+
+I haven't built anything with these libraries yet.
+
+**Cost:** I didn't price the registry with the Pricing API, but as far as I know AWS doesn't charge for Glue Schema Registry, so the weekly estimate stays at about US$31. One thing to plan for: the bastion reaches the Glue API through the internet gateway, but apps in the private subnets later would need a Glue VPC interface endpoint, which has an hourly charge.
