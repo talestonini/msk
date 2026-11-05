@@ -1,0 +1,457 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Basic Amazon MSK (provisioned) Kafka cluster in its own VPC, using SASL/SCRAM
+  authentication and Kafka ACL authorization. MSK requires the broker count to
+  be a multiple of the number of client subnets (minimum 2), so the smallest
+  possible provisioned cluster is 2 brokers - one per Availability Zone.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: basic-msk-cluster
+    AllowedPattern: '^[a-zA-Z0-9-]{1,64}$'
+    Description: Name of the MSK cluster.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC. Clients inside this range may reach the brokers.
+
+  SubnetACidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the subnet in the first Availability Zone.
+
+  SubnetBCidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the subnet in the second Availability Zone.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: CIDR block for the public subnet hosting the bastion host.
+
+  BastionInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: >
+      Instance type of the bastion host. Needs enough memory to build Java and
+      .NET apps (t3.medium = 4 GiB).
+
+  BastionAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI for the bastion host (latest Amazon Linux 2023 by default).
+
+  KafkaClientVersion:
+    Type: String
+    Default: 3.8.1
+    Description: Apache Kafka CLI version installed on the bastion host.
+
+  KafkaVersion:
+    Type: String
+    Default: 3.8.x
+    Description: Apache Kafka version (run `aws kafka list-kafka-versions` for options).
+
+  BrokerInstanceType:
+    Type: String
+    Default: kafka.t3.small
+    AllowedValues:
+      - kafka.t3.small
+      - kafka.m5.large
+      - kafka.m7g.large
+    Description: Broker instance type.
+
+  BrokerVolumeSizeGiB:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 16384
+    Description: EBS storage per broker, in GiB.
+
+  AdminUsername:
+    Type: String
+    Default: admin
+    AllowedPattern: '^[a-zA-Z0-9_-]{1,64}$'
+    Description: >
+      SASL/SCRAM admin user, used from the bastion to manage topics and ACLs.
+      Not for client applications. Its password is generated.
+
+  AllowEveryoneIfNoAclFound:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Kafka allow.everyone.if.no.acl.found. Deploy with 'true', create your ACLs
+      (including ALTER on the cluster for the admin user), then update the stack
+      with 'false' so that anything without an ACL is denied.
+
+Resources:
+  # ---------------------------------------------------------------- Networking
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref SubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-subnet-a'
+
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref SubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-subnet-b'
+
+  # Public subnet + internet gateway, used only by the bastion host (to reach
+  # SSM and download the Kafka CLI). The MSK subnets above stay private.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-subnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  MskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to MSK brokers
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: Kafka SASL/SCRAM over TLS
+          IpProtocol: tcp
+          FromPort: 9096
+          ToPort: 9096
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-sg'
+
+  # ------------------------------------------------------- SASL/SCRAM secret
+  # MSK requires SCRAM secrets to be encrypted with a customer-managed KMS key
+  # and to have a name starting with "AmazonMSK_".
+  ScramSecretKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub 'Encrypts SASL/SCRAM secrets for MSK cluster ${ClusterName}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  ScramSecretKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ClusterName}-scram'
+      TargetKeyId: !Ref ScramSecretKey
+
+  AdminScramSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'AmazonMSK_${ClusterName}_${AdminUsername}'
+      Description: !Sub 'SASL/SCRAM admin credentials for MSK cluster ${ClusterName}'
+      KmsKeyId: !Ref ScramSecretKey
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${AdminUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # --------------------------------------------------- Application SCRAM users
+  # One user per client application; its Kafka principal is User:<username>.
+  # To add an application:
+  #   1. Copy the secret resource below, giving it a new logical ID and username.
+  #   2. Add a `!Ref` to it in MskScramSecretAssociation.SecretArnList.
+  #   3. Grant it ACLs from the bastion (see kafka-acls.sh --producer/--consumer).
+  #   4. Give the application's IAM role secretsmanager:GetSecretValue on its
+  #      own secret and kms:Decrypt on ScramSecretKey, so it can read its password.
+  ExampleAppScramSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub 'AmazonMSK_${ClusterName}_example-app'
+      Description: !Sub 'SASL/SCRAM credentials for example-app on MSK cluster ${ClusterName}'
+      KmsKeyId: !Ref ScramSecretKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "example-app"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # ------------------------------------------------------------------- Kafka
+  MskConfiguration:
+    Type: AWS::MSK::Configuration
+    Properties:
+      Name: !Sub '${ClusterName}-config'
+      Description: Basic broker configuration
+      KafkaVersionsList:
+        - !Ref KafkaVersion
+      ServerProperties: !Sub |
+        auto.create.topics.enable=false
+        default.replication.factor=2
+        min.insync.replicas=1
+        num.partitions=1
+        log.retention.hours=168
+        allow.everyone.if.no.acl.found=${AllowEveryoneIfNoAclFound}
+
+  MskCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      KafkaVersion: !Ref KafkaVersion
+      NumberOfBrokerNodes: 2
+      BrokerNodeGroupInfo:
+        InstanceType: !Ref BrokerInstanceType
+        ClientSubnets:
+          - !Ref SubnetA
+          - !Ref SubnetB
+        SecurityGroups:
+          - !Ref MskSecurityGroup
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: !Ref BrokerVolumeSizeGiB
+      ConfigurationInfo:
+        Arn: !GetAtt MskConfiguration.Arn
+        Revision: !GetAtt MskConfiguration.LatestRevision.Revision
+      ClientAuthentication:
+        Unauthenticated:
+          Enabled: false
+        Sasl:
+          Scram:
+            Enabled: true
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+      EnhancedMonitoring: DEFAULT
+      Tags:
+        Name: !Ref ClusterName
+
+  # MSK allows only one of these per cluster, so it must list every SCRAM secret.
+  MskScramSecretAssociation:
+    Type: AWS::MSK::BatchScramSecret
+    Properties:
+      ClusterArn: !Ref MskCluster
+      SecretArnList:
+        - !Ref AdminScramSecret
+        - !Ref ExampleAppScramSecret
+
+  # ------------------------------------------------------------ Bastion host
+  # Accessed via SSM Session Manager: no SSH key and no inbound ports needed.
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion host - no inbound access, egress only
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-bastion-sg'
+
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: msk-client
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                # All SCRAM users of this cluster, so apps can be run from here.
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:AmazonMSK_${ClusterName}_*'
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt ScramSecretKey.Arn
+              - Effect: Allow
+                Action: kafka:GetBootstrapBrokers
+                Resource: !Ref MskCluster
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BastionRole
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicDefaultRoute
+    Properties:
+      ImageId: !Ref BastionAmiId
+      InstanceType: !Ref BastionInstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-bastion'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          # Java 21 JDK + Maven, .NET 10 SDK, and general tooling.
+          dnf install -y java-21-amazon-corretto-devel maven-amazon-corretto21 dotnet-sdk-10.0 git jq tar
+          echo 'export DOTNET_CLI_TELEMETRY_OPTOUT=1' > /etc/profile.d/dotnet.sh
+
+          # Apache Kafka CLI tools (kafka-topics.sh, kafka-acls.sh, ...).
+          # archive.apache.org is rate limited and can stall, so abort slow transfers and retry.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 20 \
+            --speed-limit 10000 --speed-time 30 -o /tmp/kafka.tgz \
+            https://archive.apache.org/dist/kafka/${KafkaClientVersion}/kafka_2.13-${KafkaClientVersion}.tgz
+          tar -xzf /tmp/kafka.tgz -C /opt && rm -f /tmp/kafka.tgz
+          ln -sfn /opt/kafka_2.13-${KafkaClientVersion} /opt/kafka
+          echo 'export PATH=$PATH:/opt/kafka/bin' > /etc/profile.d/kafka.sh
+
+          # msk-setup [username]: fetches a SCRAM user's credentials (default: the
+          # admin user) and writes, readable only by the current user:
+          #   ~/msk/bootstrap.txt          SASL/SCRAM bootstrap broker string
+          #   ~/msk/<username>.properties  for the Kafka CLI and Java clients
+          #   ~/msk/<username>.env         MSK_* environment variables for any app
+          cat > /usr/local/bin/msk-setup <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          if [ $# -ge 1 ]; then SCRAM_USER=$1; else SCRAM_USER=${AdminUsername}; fi
+          SECRET=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id "AmazonMSK_${ClusterName}_$SCRAM_USER" --query SecretString --output text)
+          SCRAM_PASS=$(echo "$SECRET" | jq -r .password)
+          BOOTSTRAP=$(aws kafka get-bootstrap-brokers --region ${AWS::Region} --cluster-arn ${MskCluster} --query BootstrapBrokerStringSaslScram --output text)
+          umask 077
+          mkdir -p ~/msk
+          echo "$BOOTSTRAP" > ~/msk/bootstrap.txt
+          cat > ~/msk/$SCRAM_USER.properties <<PROPS
+          security.protocol=SASL_SSL
+          sasl.mechanism=SCRAM-SHA-512
+          sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="$SCRAM_USER" password="$SCRAM_PASS";
+          PROPS
+          cat > ~/msk/$SCRAM_USER.env <<ENV
+          export MSK_BOOTSTRAP_SERVERS=$BOOTSTRAP
+          export MSK_SCRAM_USERNAME=$SCRAM_USER
+          export MSK_SCRAM_PASSWORD=$SCRAM_PASS
+          ENV
+          echo "Wrote ~/msk/bootstrap.txt, ~/msk/$SCRAM_USER.properties and ~/msk/$SCRAM_USER.env"
+          echo "CLI example: kafka-topics.sh --bootstrap-server \$(cat ~/msk/bootstrap.txt) --command-config ~/msk/$SCRAM_USER.properties --list"
+          echo "App example: source ~/msk/$SCRAM_USER.env && <run your app>"
+          EOF
+          chmod 755 /usr/local/bin/msk-setup
+
+Outputs:
+  ClusterArn:
+    Description: ARN of the MSK cluster.
+    Value: !Ref MskCluster
+
+  VpcId:
+    Description: VPC containing the cluster.
+    Value: !Ref Vpc
+
+  SubnetIds:
+    Description: Subnets the brokers are placed in.
+    Value: !Join [',', [!Ref SubnetA, !Ref SubnetB]]
+
+  SecurityGroupId:
+    Description: Security group attached to the brokers.
+    Value: !Ref MskSecurityGroup
+
+  AdminScramSecretArn:
+    Description: Secret holding the SASL/SCRAM admin username and password.
+    Value: !Ref AdminScramSecret
+
+  ExampleAppScramSecretArn:
+    Description: Secret holding the SASL/SCRAM credentials for example-app.
+    Value: !Ref ExampleAppScramSecret
+
+  ScramSecretKeyArn:
+    Description: KMS key encrypting the SCRAM secrets (apps need kms:Decrypt on it).
+    Value: !GetAtt ScramSecretKey.Arn
+
+  BastionInstanceId:
+    Description: Instance ID of the bastion host.
+    Value: !Ref BastionHost
+
+  BastionConnectCommand:
+    Description: Open a shell on the bastion (requires the Session Manager plugin).
+    Value: !Sub 'aws ssm start-session --region ${AWS::Region} --target ${BastionHost}'
+
+  GetBootstrapBrokersCommand:
+    Description: Run this to get the SASL/SCRAM broker connection string.
+    Value: !Sub 'aws kafka get-bootstrap-brokers --cluster-arn ${MskCluster} --query BootstrapBrokerStringSaslScram --output text'
