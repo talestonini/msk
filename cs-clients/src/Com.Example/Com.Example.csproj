@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Produces and consumes TemperatureChanged Avro events on MSK, using the Glue Schema Registry.
+       See ../../README.md for how to run the producer and consumer. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Com.Example</RootNamespace>
+    <AssemblyName>Com.Example</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- The Glue Schema Registry package ships native libraries for linux-x64 only. -->
+    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <!-- Generated Avro code isn't nullable-annotated. -->
+    <NoWarn>$(NoWarn);CS8618;CS8625</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Kafka client (wraps librdkafka). -->
+    <PackageReference Include="Confluent.Kafka" Version="2.16.0" />
+    <!-- Same Avro version the Glue Schema Registry package is built against. -->
+    <PackageReference Include="Apache.Avro" Version="1.12.0" />
+    <!-- Glue Schema Registry serializers. The version suffix selects the platform:
+         linux-x64 = glibc Linux on x86_64, such as Amazon Linux 2023 on the bastion. -->
+    <PackageReference Include="AWS.Glue.SchemaRegistry" Version="1.0.1-linux-x64" />
+  </ItemGroup>
+
+  <!-- Generate C# classes from the repo's avro/*.avsc before compiling, using the avrogen
+       tool pinned in cs-clients/.config/dotnet-tools.json (the equivalent of avro-maven-plugin).
+       The generated class keeps the Avro namespace (com.example.events): the Avro library finds
+       it by the schema's full name when deserializing. -->
+  <PropertyGroup>
+    <AvroOutputDir>$(MSBuildProjectDirectory)/obj/generated-avro</AvroOutputDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <AvroSchema Include="$(MSBuildProjectDirectory)/../../../avro/*.avsc" />
+  </ItemGroup>
+  <Target Name="GenerateAvroClasses" BeforeTargets="CoreCompile" Condition="'@(AvroSchema)' != ''">
+    <RemoveDir Directories="$(AvroOutputDir)" />
+    <Exec Command="dotnet tool restore" WorkingDirectory="$(MSBuildProjectDirectory)" StandardOutputImportance="low" />
+    <Exec Command="dotnet avrogen -s &quot;%(AvroSchema.FullPath)&quot; &quot;$(AvroOutputDir)&quot;" WorkingDirectory="$(MSBuildProjectDirectory)" />
+    <ItemGroup>
+      <Compile Include="$(AvroOutputDir)/**/*.cs" />
+    </ItemGroup>
+  </Target>
+
+</Project>

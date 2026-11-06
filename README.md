@@ -50,7 +50,7 @@
       --group temperature-consumers
 
 
-## Run client
+## Run Java clients
 
     -- consumer
     java -cp target/temperature-clients.jar com.example.TemperatureConsumer consumer.properties
