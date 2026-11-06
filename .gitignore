@@ -1,3 +1,5 @@
 .metals/
 .vscode/
 java-clients/target/
+cs-clients/src/Com.Example/bin/
+cs-clients/src/Com.Example/obj/
